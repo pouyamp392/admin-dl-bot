@@ -73,11 +73,6 @@ CONFIG: dict = {
 # ---------------- Database ----------------
 
 def prepare_database_url(url: str) -> str:
-    """
-    SSL را جداگانه به asyncpg می‌دهیم.
-    پارامترهای sslmode و channel_binding از URL حذف می‌شوند
-    تا با اتصال مستقیم asyncpg تداخل نداشته باشند.
-    """
     parts = urlsplit(url)
 
     query = [
@@ -155,7 +150,6 @@ class Storage:
 
         channels = row["channels"]
 
-        # asyncpg ممکن است JSONB را به شکل رشته برگرداند.
         if isinstance(channels, str):
             channels = json.loads(channels)
 
@@ -223,26 +217,42 @@ MEMBER_TTL = 30
 
 async def is_member(bot, chat_id: int, user_id: int):
     """
-    True: عضو است
-    False: عضو نیست
-    None: وضعیت نامشخص است
+    True: عضویت تأیید شده
+    False: کاربر عضو نیست
+    None: عضویت قابل تأیید نیست
+
+    فقط نتیجه مثبت در کش ذخیره می‌شود.
     """
+
     key = (chat_id, user_id)
     now = time.time()
 
     cached = _member_cache.get(key)
 
-    if cached and now - cached < MEMBER_TTL:
-        return True
+    if cached is not None:
+        if now - cached < MEMBER_TTL:
+            return True
+
+        _member_cache.pop(key, None)
 
     try:
-        member = await bot.get_chat_member(chat_id, user_id)
+        member = await bot.get_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+        )
 
     except TelegramError as e:
         logger.warning(
-            "get_chat_member failed for chat %s: %s",
+            "get_chat_member failed for chat_id=%s: %s",
             chat_id,
             e,
+        )
+        return None
+
+    except Exception:
+        logger.exception(
+            "Unexpected membership check error for chat_id=%s",
+            chat_id,
         )
         return None
 
@@ -256,8 +266,9 @@ async def is_member(bot, chat_id: int, user_id: int):
 
     if joined:
         _member_cache[key] = now
+        return True
 
-    return joined
+    return False
 
 
 # ---------------- HTTP API ----------------
@@ -285,15 +296,16 @@ async def api_check(request: web.Request):
     try:
         user_id = int(request.query.get("user_id", ""))
 
+        if user_id <= 0:
+            raise ValueError
+
     except (ValueError, TypeError):
         return web.json_response(
             {"error": "bad user_id"},
             status=400,
         )
 
-    channels = CONFIG["channels"]
-
-    if not CONFIG["enabled"] or not channels:
+    if not CONFIG["enabled"] or not CONFIG["channels"]:
         return web.json_response(
             {
                 "ok": True,
@@ -303,15 +315,36 @@ async def api_check(request: web.Request):
         )
 
     bot = request.app["bot"]
+    channels = CONFIG["channels"]
 
-    results = await asyncio.gather(
+    raw_results = await asyncio.gather(
         *[
-            is_member(bot, channel["chat_id"], user_id)
+            is_member(
+                bot,
+                int(channel["chat_id"]),
+                user_id,
+            )
             for channel in channels
-        ]
+        ],
+        return_exceptions=True,
     )
 
-    # فقط مواردی که قطعاً عضویت ندارند گزارش می‌شوند.
+    results = []
+
+    for channel, result in zip(channels, raw_results):
+        if isinstance(result, BaseException):
+            logger.error(
+                "Membership check crashed for chat_id=%s: %s",
+                channel.get("chat_id"),
+                result,
+            )
+            results.append(None)
+        else:
+            results.append(result)
+
+    # نکته امنیتی:
+    # فقط True به معنی عضویت تأییدشده است.
+    # False و None هر دو باید مانع دسترسی شوند.
     missing = [
         {
             "chat_id": channel["chat_id"],
@@ -319,12 +352,22 @@ async def api_check(request: web.Request):
             "link": channel["link"],
         }
         for channel, joined in zip(channels, results)
-        if joined is False
+        if joined is not True
     ]
+
+    is_allowed = len(missing) == 0
+
+    logger.info(
+        "Membership API: user_id=%s, allowed=%s, channels=%s, unverified=%s",
+        user_id,
+        is_allowed,
+        len(channels),
+        len(missing),
+    )
 
     return web.json_response(
         {
-            "ok": not missing,
+            "ok": is_allowed,
             "enabled": True,
             "missing": missing,
         }
@@ -469,7 +512,6 @@ async def safe_edit(query, text: str, markup=None):
 
 def is_admin(update: Update) -> bool:
     user = update.effective_user
-
     return bool(user and user.id in ADMIN_IDS)
 
 
@@ -575,7 +617,6 @@ async def on_admin_callback(
         CONFIG["enabled"] = not CONFIG["enabled"]
 
         saved = await persist()
-
         text = panel_text()
 
         if not saved:
@@ -597,11 +638,10 @@ async def on_admin_callback(
         CONFIG["channels"] = [
             channel
             for channel in CONFIG["channels"]
-            if channel["chat_id"] != chat_id
+            if int(channel["chat_id"]) != chat_id
         ]
 
         saved = await persist()
-
         text = list_text()
 
         if not saved:
@@ -689,7 +729,7 @@ async def on_message(
         return
 
     if any(
-        channel["chat_id"] == chat.id
+        int(channel["chat_id"]) == chat.id
         for channel in CONFIG["channels"]
     ):
         await message.reply_text(
@@ -750,7 +790,6 @@ async def on_message(
     )
 
     saved = await persist()
-
     context.user_data.pop("awaiting", None)
 
     suffix = (
@@ -779,9 +818,6 @@ async def post_init(application: Application):
     global storage, CONFIG
 
     storage = Storage()
-
-    # اگر دیتابیس در دسترس نباشد، برنامه نباید وانمود کند
-    # که تنظیمات مشترک با موفقیت بارگذاری شده‌اند.
     await storage.connect()
 
     CONFIG = await storage.load()
