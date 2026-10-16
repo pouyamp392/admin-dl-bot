@@ -1,3 +1,5 @@
+
 python-telegram-bot>=21.0,<23.0
 aiohttp
 python-dotenv
+asyncpg
